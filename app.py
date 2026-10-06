@@ -893,38 +893,42 @@ with tab_chat:
                 st.session_state.pending = text
         cols[-1].button(t["clear"], key="clear_main", on_click=clear_chat)
 
-        with st.chat_message("assistant"):
-            st.markdown(t["greeting"])
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]):
-                st.markdown(m["content"])
-
+        # Messages go into a container that is created BEFORE the input bar, so the bar always stays
+        # below the whole conversation (including the reply that is being streamed right now).
+        chat_box = st.container()
         prompt = st.chat_input(t["placeholder"])
         if not prompt and st.session_state.get("pending"):
             prompt = st.session_state.pop("pending")
 
-        if prompt:
-            with st.chat_message("user"):
-                st.markdown(prompt)
+        with chat_box:
             with st.chat_message("assistant"):
-                if is_contact_request(prompt):
-                    # Answered directly from code: instant and always the exact, correct details
-                    reply = f"{t['contact_intro']}\n\n{CONTACT_MD}"
-                    st.markdown(reply)
-                    st.session_state.messages += [{"role": "user", "content": prompt},
-                                                  {"role": "assistant", "content": reply}]
-                    save_history(sid, st.session_state.messages)
-                    st.session_state.pop("chat", None)  # rebuilt from saved history on the next message
-                else:
-                    try:
-                        reply = st.write_stream(st.session_state.chat.stream_message(prompt))
+                st.markdown(t["greeting"])
+            for m in st.session_state.messages:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+
+            if prompt:
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                with st.chat_message("assistant"):
+                    if is_contact_request(prompt):
+                        # Answered directly from code: instant and always the exact, correct details
+                        reply = f"{t['contact_intro']}\n\n{CONTACT_MD}"
+                        st.markdown(reply)
                         st.session_state.messages += [{"role": "user", "content": prompt},
                                                       {"role": "assistant", "content": reply}]
                         save_history(sid, st.session_state.messages)
-                    except Exception as e:
-                        print(f"[chat error] {e}", file=sys.stderr)  # details stay in the server logs only
-                        st.warning(t["busy"] if _is_busy(e) else t["err_generic"])
-                        st.session_state.pop("chat", None)  # rebuilt cleanly from saved history next time
+                        st.session_state.pop("chat", None)  # rebuilt from saved history on the next message
+                    else:
+                        try:
+                            reply = st.write_stream(st.session_state.chat.stream_message(prompt))
+                            st.session_state.messages += [{"role": "user", "content": prompt},
+                                                          {"role": "assistant", "content": reply}]
+                            save_history(sid, st.session_state.messages)
+                        except Exception as e:
+                            print(f"[chat error] {e}", file=sys.stderr)  # details stay in the server logs only
+                            st.warning(t["busy"] if _is_busy(e) else t["err_generic"])
+                            st.session_state.pop("chat", None)  # rebuilt cleanly from saved history next time
 
 st.markdown(contact_html(t), unsafe_allow_html=True)
 st.markdown(f'<div class="footer">{t["footer"]}</div>', unsafe_allow_html=True)
