@@ -1,5 +1,5 @@
 """
-InnovateX Solution Agent  -  OpenRouter (free models) AI agent + Streamlit marketing website.
+InnovateX Solution Agent  -  OpenRouter (free models) AI agent (only needs: streamlit + requests) + Streamlit marketing website.
 
 Setup (macOS / Linux):
     export OPENROUTER_API_KEY="your-new-key"
@@ -11,13 +11,14 @@ import inspect
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-from openai import OpenAI
+import requests
 
 # ======================================================================
 # 1) SETTINGS & COMPANY DATA
@@ -294,25 +295,48 @@ Other rules (use the tools, never invent facts):
 # 3) AGENT + HISTORY STORAGE
 # ======================================================================
 def get_api_key():
-    """Read the key from the OPENROUTER_API_KEY env var or Streamlit secrets (never hardcode it)."""
-    key = os.environ.get("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")
+    """Read the key from the OPENROUTER_API_KEY env var or Streamlit secrets (never shown in the UI)."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if key:
         return key
     try:
-        return st.secrets["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"]
+        for name in ("OPENROUTER_API_KEY", "openrouter_api_key", "OPENROUTER_KEY"):
+            if name in st.secrets:
+                return str(st.secrets[name]).strip().strip('"').strip("'")
+        for _, value in st.secrets.items():  # tolerate a differently named secret holding an OpenRouter key
+            if isinstance(value, str) and value.strip().startswith("sk-or-"):
+                return value.strip()
     except Exception:
-        return None
+        pass
+    return None
 
 
-@st.cache_resource
-def get_client(api_key: str):
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-        timeout=REQUEST_TIMEOUT,
-        max_retries=0,  # no hidden SDK retries: retries are handled explicitly below
-        default_headers={"HTTP-Referer": "https://innovatex.example", "X-Title": "InnovateX Solution Agent"},
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def post_stream(api_key: str, payload: dict):
+    """POST to OpenRouter and yield the parsed streaming (SSE) chunks. Uses only `requests`."""
+    r = requests.post(
+        API_URL, json=payload, stream=True, timeout=(10, REQUEST_TIMEOUT),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                 "HTTP-Referer": "https://innovatex.example", "X-Title": "InnovateX Solution Agent"},
     )
+    r.encoding = "utf-8"  # important for Arabic text
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue  # skips keep-alive comments such as ": OPENROUTER PROCESSING"
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if obj.get("error"):
+            raise RuntimeError(f"HTTP {obj['error'].get('code', '')}: {obj['error'].get('message', obj['error'])}")
+        yield obj
 
 
 def _tool_schema(fn):
@@ -349,33 +373,31 @@ class ChatSession:
     """Streaming chat with tool calling over OpenRouter, with fallback across free models."""
 
     def __init__(self, api_key: str, history: list):
-        self.client = get_client(api_key)
+        self.api_key = api_key
         self.history = [{"role": m["role"], "content": m["content"]} for m in history][-MAX_HISTORY:]
 
     def _run_stream(self, model: str, msgs: list, state: dict):
         """Yield text chunks. Handles tool calls between streamed rounds."""
         for _ in range(MAX_TOOL_ROUNDS):
-            stream = self.client.chat.completions.create(
-                model=model, messages=msgs, tools=TOOL_SCHEMAS, temperature=0.5,
-                stream=True, max_tokens=MAX_TOKENS,
-                extra_body={"reasoning": {"effort": "low"}},
-            )
+            payload = {"model": model, "messages": msgs, "tools": TOOL_SCHEMAS, "temperature": 0.5,
+                       "stream": True, "max_tokens": MAX_TOKENS, "reasoning": {"effort": "low"}}
             text, calls = "", {}
-            for chunk in stream:
-                if not chunk.choices:
+            for chunk in post_stream(self.api_key, payload):
+                if not chunk.get("choices"):
                     continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    text += delta.content
-                    yield delta.content
-                for tc in delta.tool_calls or []:
-                    c = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-                    if tc.id:
-                        c["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        c["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        c["args"] += tc.function.arguments
+                delta = chunk["choices"][0].get("delta") or {}
+                if delta.get("content"):
+                    text += delta["content"]
+                    yield delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        c["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        c["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        c["args"] += fn["arguments"]
 
             calls = {i: c for i, c in calls.items() if c["name"]}
             if not calls:
@@ -477,11 +499,12 @@ T = {
         "clear": "🗑️ Clear chat", "download": "⬇️ Download chat",
         "saved": "💾 Your conversation is saved. Bookmark this page to continue later.",
         "theme": "🎨 Theme",
-        "key_info": "The AI chat needs an OpenRouter API key (sidebar or OPENROUTER_API_KEY). "
-                    "The step-by-step guide works without it.",
+        "key_info": "The AI chat is temporarily unavailable. Please use the “Step-by-step guide” tab "
+                    "or contact us directly using the details above.",
         "busy": "The AI service is very busy right now. Please try again in a minute, or use the "
                 "“Step-by-step guide” tab to get your estimate right away.",
         "err": "Sorry, something went wrong", "thinking": "Thinking...",
+        "err_generic": "Sorry, something went wrong. Please try again, use the “Step-by-step guide” tab, or contact us using the details above.",
         "footer": "© InnovateX Solution — Smart IT & software solutions",
         "quick": [("🧩 Our services", "What services do you offer?"),
                   ("💰 Get a quote", "I want a price estimate for a project"),
@@ -523,11 +546,12 @@ T = {
         "clear": "🗑️ مسح المحادثة", "download": "⬇️ تحميل المحادثة",
         "saved": "💾 محادثتك محفوظة. احفظ هذه الصفحة في المفضلة لتكمل لاحقًا.",
         "theme": "🎨 المظهر",
-        "key_info": "محادثة الذكاء الاصطناعي تحتاج مفتاح OpenRouter API (الشريط الجانبي أو OPENROUTER_API_KEY). "
-                    "أما الدليل خطوة بخطوة فيعمل بدونه.",
+        "key_info": "محادثة الذكاء الاصطناعي غير متاحة مؤقتًا. من فضلك استخدم تبويب «دليل خطوة بخطوة» "
+                    "أو تواصل معنا مباشرة عبر البيانات أعلاه.",
         "busy": "الخدمة مشغولة حاليًا. حاول بعد دقيقة، أو استخدم تبويب «دليل خطوة بخطوة» "
                 "لتحصل على تقديرك فورًا.",
         "err": "عذرًا، حدث خطأ", "thinking": "جارٍ التفكير...",
+        "err_generic": "عذرًا، حدث خطأ. حاول مرة أخرى، أو استخدم تبويب «دليل خطوة بخطوة»، أو تواصل معنا عبر البيانات أعلاه.",
         "footer": "© إنوفيتكس سوليوشن — حلول تقنية وبرمجية ذكية",
         "quick": [("🧩 خدماتنا", "ما هي الخدمات التي تقدمونها؟"),
                   ("💰 احصل على عرض سعر", "أريد تقدير سعر لمشروع"),
@@ -822,8 +846,6 @@ with st.sidebar:
     st.markdown("📱 " + " | ".join(PHONES))
     st.link_button(t["cta_wa"], WHATSAPP_LINK)
     st.divider()
-    if not api_key:
-        api_key = st.text_input("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", type="password")
     st.button(t["clear"], key="clear_side", on_click=clear_chat)
     transcript = "\n\n".join(f"[{m['role']}] {m['content']}" for m in st.session_state.messages) or "—"
     st.download_button(t["download"], transcript, file_name="innovatex-chat.txt")
@@ -900,7 +922,8 @@ with tab_chat:
                                                       {"role": "assistant", "content": reply}]
                         save_history(sid, st.session_state.messages)
                     except Exception as e:
-                        st.warning(t["busy"] if _is_busy(e) else f'⚠️ {t["err"]}: {e}')
+                        print(f"[chat error] {e}", file=sys.stderr)  # details stay in the server logs only
+                        st.warning(t["busy"] if _is_busy(e) else t["err_generic"])
                         st.session_state.pop("chat", None)  # rebuilt cleanly from saved history next time
 
 st.markdown(contact_html(t), unsafe_allow_html=True)
