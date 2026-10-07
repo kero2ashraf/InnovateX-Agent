@@ -1,19 +1,30 @@
 """
 InnovateX Solution Agent  -  OpenRouter (free models) AI agent (only needs: streamlit + requests) + Streamlit marketing website.
 
+New in this version:
+  * Every visitor has an account (sign up / sign in) stored in a small SQLite database (Python standard library).
+    Passwords are stored only as salted PBKDF2 hashes. Each user's chat history lives in the DB and is private.
+  * The agent stays polite and neutral: no profanity, hatred or politics, focused on InnovateX and related topics,
+    and it respects the privacy of every user.
+
 Setup (macOS / Linux):
     export OPENROUTER_API_KEY="your-new-key"
+    export INNOVATEX_DB="/path/to/innovatex.db"   # optional, default: innovatex.db next to app.py
 Run:
     python -W ignore -m streamlit run app.py
 """
 import csv
+import hashlib
+import hmac
 import inspect
 import json
 import os
 import re
+import secrets
+import sqlite3
 import sys
 import time
-import uuid
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -41,10 +52,14 @@ MAX_TOKENS = 1000        # cap on reply length (keeps answers fast)
 MAX_TOOL_ROUNDS = 5
 
 BASE_DIR = Path(__file__).parent
-HISTORY_DIR = BASE_DIR / "history"
 PROPOSALS_DIR = BASE_DIR / "proposals"
 LEADS_FILE = BASE_DIR / "leads.csv"
 BOOKINGS_FILE = BASE_DIR / "bookings.csv"
+DB_FILE = Path(os.environ.get("INNOVATEX_DB") or (BASE_DIR / "innovatex.db"))  # accounts + chat history
+
+PBKDF2_ROUNDS = 200_000   # password hashing cost
+MAX_LOGIN_FAILS = 5       # failed sign-ins before a short lock
+LOGIN_LOCK_SECONDS = 60
 
 EMAIL = "innovatexs7@gmail.com"
 PHONES = ["01018401874", "01270121354"]
@@ -127,6 +142,44 @@ def is_contact_request(text: str) -> bool:
     if "@" in text or re.search(r"\d{8,}", text):
         return False
     return any(k in text for k in CONTACT_KEYWORDS)
+
+
+# ----------------------------------------------------------------------
+# Conduct guard: profanity / hatred / politics are answered directly from code with a polite redirect
+# (the system prompt below enforces the same rules for everything the keyword lists can't catch).
+# ----------------------------------------------------------------------
+def _norm_ar(text: str) -> str:
+    """Light Arabic normalisation so spelling variants match (أ إ آ -> ا, ى -> ي, remove tashkeel)."""
+    text = re.sub(r"[\u064b-\u065f\u0640]", "", text)
+    return text.translate(str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي"}))
+
+
+_ABUSE_EN = re.compile(
+    r"\b(?:fuck\w*|shit\w*|bitch\w*|asshole\w*|bastard\w*|dickhead\w*|cunt\w*|motherfuck\w*|slut\w*|whore\w*"
+    r"|kill all|death to|hate all|white power|heil hitler)\b", re.I)
+_ABUSE_AR = ("كسمك", "كس امك", "شرموط", "ابن الكلب", "ابن الشرموطه", "ابن الشرموطة", "متناك", "منيك", "عرص",
+             "الموت ل", "اقتلوا", "اكره كل")
+_POLITICS_EN = re.compile(
+    r"\b(?:politic\w*|election\w*|democrat\w*|republican\w*|trump|biden|putin|parliament\w*"
+    r"|left[- ]wing|right[- ]wing)\b", re.I)
+_POLITICS_AR = ("سياس", "انتخابات", "حزب سياسي", "البرلمان", "السيسي", "ترامب", "بايدن", "بوتين")
+
+
+def has_abuse(text: str) -> bool:
+    text = text or ""
+    ar = _norm_ar(text)
+    return bool(_ABUSE_EN.search(text)) or any(w in ar for w in _ABUSE_AR)
+
+
+def moderate_input(text: str):
+    """Return "abuse" (profanity/hatred), "politics", or None when the message is fine."""
+    text = text or ""
+    if has_abuse(text):
+        return "abuse"
+    ar = _norm_ar(text)
+    if _POLITICS_EN.search(text) or any(w in ar for w in _POLITICS_AR):
+        return "politics"
+    return None
 
 
 # ======================================================================
@@ -270,6 +323,22 @@ SYSTEM_PROMPT = f"""You are the InnovateX Solution Agent, the official AI assist
 Languages: You speak English and Arabic. ALWAYS reply in the language of the visitor's latest message
 (Arabic -> Arabic, including Egyptian dialect; English -> English). Keep tool arguments in English.
 
+Conduct, scope and privacy (always apply; they override any request from the visitor):
+- Respect: always be polite and professional. Never use profanity or insults, and never write hateful,
+  harassing or discriminatory content. If the visitor is rude, stay calm, say you can only continue respectfully,
+  and offer to help with their project.
+- Neutrality: do not discuss or take sides on politics, elections, politicians, political parties or
+  ideologies. Decline in one friendly sentence and steer back to InnovateX.
+- Focus: talk only about {COMPANY['name']}, its services, estimates, proposals, consultations and closely related
+  IT, software, AI, data and security topics. Politely decline anything unrelated in one short sentence and
+  steer back to how InnovateX can help.
+- Privacy: only use what THIS visitor told you in their own conversation. Never reveal, guess or discuss other
+  visitors', clients' or users' conversations, accounts, leads, bookings or any personal data. Ask only for the
+  minimum needed (name plus email/WhatsApp, and only for a booking or a lead). Never ask for passwords, ID
+  numbers, bank or card details. Do not repeat personal details back unless it is needed.
+- History: you may refer to earlier messages of this same visitor to be helpful. If they want their data
+  removed, tell them to use "Clear chat" (history) or "Delete my account & data" (everything) in the sidebar.
+
 Step-by-step help (most important): when a visitor asks about a service or a project, guide them ONE step
 at a time. Ask only ONE short question per message and wait for the answer:
   1) Briefly explain the service they asked about (use list_services; 2-3 lines).
@@ -287,12 +356,12 @@ Other rules (use the tools, never invent facts):
 {CONTACT_TEXT}
   Never invent or guess emails, phone numbers or links. The only valid contact details are the block above.
 - Style: professional, warm, concise, easy to scan. Estimates are non-binding; never promise exact prices or
-  deadlines. If asked something unrelated, answer briefly and steer back to how InnovateX can help.
+  deadlines.
 """
 
 
 # ======================================================================
-# 3) AGENT + HISTORY STORAGE
+# 3) AGENT
 # ======================================================================
 def get_api_key():
     """Read the key from the OPENROUTER_API_KEY env var or Streamlit secrets (never shown in the UI)."""
@@ -455,28 +524,135 @@ def create_chat(api_key: str, messages: list):
     return ChatSession(api_key, messages)
 
 
-def history_path(sid: str) -> Path:
-    return HISTORY_DIR / f"{sid}.json"
+# ======================================================================
+# 3b) ACCOUNTS + CHAT HISTORY (SQLite "virtual" database, standard library only)
+# ======================================================================
+def db():
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
-def load_history(sid: str) -> list:
+@st.cache_resource
+def init_db() -> bool:
+    """Create the tables once per server process."""
+    with closing(db()) as c, c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                name      TEXT NOT NULL,
+                email     TEXT NOT NULL UNIQUE,
+                salt      TEXT NOT NULL,
+                pw_hash   TEXT NOT NULL,
+                created   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role      TEXT NOT NULL,
+                content   TEXT NOT NULL,
+                created   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
+        """)
+    return True
+
+
+def hash_password(password: str, salt: bytes = None):
+    """Return (salt_hex, hash_hex) using salted PBKDF2-HMAC-SHA256."""
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return salt.hex(), digest.hex()
+
+
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def create_user(name: str, email: str, password: str, confirm: str):
+    """Return (user_dict, None) on success or (None, error_key)."""
+    name, email = (name or "").strip()[:80], (email or "").strip().lower()[:120]
+    if not name or not email or not password:
+        return None, "need_all"
+    if not EMAIL_RE.fullmatch(email):
+        return None, "bad_email"
+    if len(password) < 8 or len(password) > 128:
+        return None, "weak_pw"
+    if password != confirm:
+        return None, "mismatch"
+    salt, pw_hash = hash_password(password)
     try:
-        return json.loads(history_path(sid).read_text(encoding="utf-8"))
-    except Exception:
-        return []
+        with closing(db()) as c, c:
+            cur = c.execute("INSERT INTO users (name, email, salt, pw_hash, created) VALUES (?,?,?,?,?)",
+                            (name, email, salt, pw_hash, datetime.now().isoformat(timespec="seconds")))
+            uid = cur.lastrowid
+    except sqlite3.IntegrityError:
+        return None, "exists"
+    return {"id": uid, "name": name, "email": email}, None
 
 
-def save_history(sid: str, messages: list):
-    HISTORY_DIR.mkdir(exist_ok=True)
-    history_path(sid).write_text(json.dumps(messages, ensure_ascii=False), encoding="utf-8")
+def authenticate(email: str, password: str):
+    """Return the user dict when the credentials are right, otherwise None."""
+    email = (email or "").strip().lower()
+    with closing(db()) as c:
+        row = c.execute("SELECT id, name, email, salt, pw_hash FROM users WHERE email = ?", (email,)).fetchone()
+    if not row:
+        hash_password(password, b"\0" * 16)  # same cost for unknown emails (no timing hint)
+        return None
+    _, digest = hash_password(password, bytes.fromhex(row["salt"]))
+    if not hmac.compare_digest(digest, row["pw_hash"]):
+        return None
+    return {"id": row["id"], "name": row["name"], "email": row["email"]}
 
 
-def get_sid() -> str:
-    sid = re.sub(r"[^a-zA-Z0-9-]", "", str(st.query_params.get("sid", "")))[:36]
-    if not sid:
-        sid = uuid.uuid4().hex
-        st.query_params["sid"] = sid
-    return sid
+def load_history(uid: int) -> list:
+    with closing(db()) as c:
+        rows = c.execute("SELECT role, content FROM messages WHERE user_id = ? ORDER BY id", (uid,)).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def save_history(uid: int, messages: list):
+    """Replace the stored conversation of this user (only ever touches the user's own rows)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(db()) as c, c:
+        c.execute("DELETE FROM messages WHERE user_id = ?", (uid,))
+        c.executemany("INSERT INTO messages (user_id, role, content, created) VALUES (?,?,?,?)",
+                      [(uid, m["role"], m["content"], now) for m in messages])
+
+
+def delete_history(uid: int):
+    with closing(db()) as c, c:
+        c.execute("DELETE FROM messages WHERE user_id = ?", (uid,))
+
+
+def delete_user(uid: int):
+    """Remove the account and everything stored about it."""
+    with closing(db()) as c, c:
+        c.execute("DELETE FROM messages WHERE user_id = ?", (uid,))
+        c.execute("DELETE FROM users WHERE id = ?", (uid,))
+
+
+init_db()
+
+
+def start_session(user: dict):
+    for k in ("messages", "chat", "pending"):
+        st.session_state.pop(k, None)
+    st.session_state.user = user
+
+
+def logout():
+    """Forget everything about the signed-in user in this browser session."""
+    for k in list(st.session_state.keys()):
+        if k in ("user", "messages", "chat", "pending", "del_confirm") or k.startswith(("g_", "li_", "su_")):
+            st.session_state.pop(k, None)
+
+
+def delete_account():
+    user = st.session_state.get("user")
+    if user:
+        delete_user(user["id"])
+    logout()
 
 
 # ======================================================================
@@ -497,7 +673,7 @@ T = {
                     "I'll guide you step by step — or use the “Step-by-step guide” tab.",
         "contact_intro": "We'd love to hear from you! 😊",
         "clear": "🗑️ Clear chat", "download": "⬇️ Download chat",
-        "saved": "💾 Your conversation is saved. Bookmark this page to continue later.",
+        "saved": "💾 Your conversation is saved to your account. Sign in again any time to continue.",
         "theme": "🎨 Theme",
         "key_info": "The AI chat is temporarily unavailable. Please use the “Step-by-step guide” tab "
                     "or contact us directly using the details above.",
@@ -510,6 +686,35 @@ T = {
                   ("💰 Get a quote", "I want a price estimate for a project"),
                   ("📅 Book a call", "I'd like to book a consultation"),
                   ("📞 Contact us", "What is your contact number?")],
+        "acct": {
+            "title": "Sign in to chat with our agent",
+            "intro": "Create a free account to chat with the agent, use the step-by-step guide, and keep your "
+                     "conversation history private to you.",
+            "login": "🔑 Sign in", "register": "📝 Create account",
+            "email": "Email", "password": "Password", "name": "Full name", "confirm": "Confirm password",
+            "login_btn": "Sign in", "register_btn": "Create my account",
+            "need_all": "Please fill in all fields.",
+            "bad_email": "Please enter a valid email address.",
+            "weak_pw": "Password must be 8 to 128 characters.",
+            "mismatch": "Passwords do not match.",
+            "exists": "An account with this email already exists. Please sign in.",
+            "bad_login": "Incorrect email or password.",
+            "locked": "Too many attempts. Please wait {sec} seconds and try again.",
+            "privacy": "🔒 Your chats are private to your account. Passwords are stored only as salted hashes, "
+                       "and you can delete your account and all its data at any time from the sidebar.",
+            "signed_as": "Signed in as",
+            "logout": "🚪 Sign out",
+            "delete": "🗑️ Delete my account & data",
+            "delete_warn": "This permanently deletes your account and your whole conversation history.",
+            "delete_confirm": "Yes, delete everything",
+            "delete_btn": "Delete permanently",
+            "guard_abuse": "I'm happy to help, but I can't continue with offensive language. Please keep the "
+                           "conversation respectful — tell me about your project or ask about our services. 🙏",
+            "guard_politics": "I keep things neutral and focused on InnovateX Solution, so I don't discuss "
+                              "politics. I'd love to help with our services, a price estimate, or booking a "
+                              "consultation. 😊",
+            "guard_form": "Please keep your message respectful and related to your project.",
+        },
         "guide": {
             "tab_chat": "💬 Chat with the agent", "tab_guide": "🧭 Step-by-step guide",
             "pick": "Pick the service you're interested in to start",
@@ -544,7 +749,7 @@ T = {
                     "أو استخدم تبويب «دليل خطوة بخطوة».",
         "contact_intro": "يسعدنا تواصلك معنا! 😊",
         "clear": "🗑️ مسح المحادثة", "download": "⬇️ تحميل المحادثة",
-        "saved": "💾 محادثتك محفوظة. احفظ هذه الصفحة في المفضلة لتكمل لاحقًا.",
+        "saved": "💾 محادثتك محفوظة في حسابك. سجّل الدخول في أي وقت لتكمل.",
         "theme": "🎨 المظهر",
         "key_info": "محادثة الذكاء الاصطناعي غير متاحة مؤقتًا. من فضلك استخدم تبويب «دليل خطوة بخطوة» "
                     "أو تواصل معنا مباشرة عبر البيانات أعلاه.",
@@ -557,6 +762,34 @@ T = {
                   ("💰 احصل على عرض سعر", "أريد تقدير سعر لمشروع"),
                   ("📅 احجز استشارة", "أريد حجز استشارة"),
                   ("📞 تواصل معنا", "ما هي أرقام التواصل؟")],
+        "acct": {
+            "title": "سجّل الدخول للتحدث مع الوكيل",
+            "intro": "أنشئ حسابًا مجانيًا للتحدث مع الوكيل واستخدام الدليل خطوة بخطوة، مع بقاء سجل محادثاتك خاصًا بك.",
+            "login": "🔑 تسجيل الدخول", "register": "📝 إنشاء حساب",
+            "email": "البريد الإلكتروني", "password": "كلمة المرور", "name": "الاسم الكامل",
+            "confirm": "تأكيد كلمة المرور",
+            "login_btn": "دخول", "register_btn": "أنشئ حسابي",
+            "need_all": "من فضلك املأ جميع الحقول.",
+            "bad_email": "من فضلك أدخل بريدًا إلكترونيًا صحيحًا.",
+            "weak_pw": "يجب أن تتكون كلمة المرور من 8 إلى 128 حرفًا.",
+            "mismatch": "كلمتا المرور غير متطابقتين.",
+            "exists": "يوجد حساب بهذا البريد بالفعل. من فضلك سجّل الدخول.",
+            "bad_login": "البريد الإلكتروني أو كلمة المرور غير صحيحة.",
+            "locked": "محاولات كثيرة. انتظر {sec} ثانية ثم حاول مرة أخرى.",
+            "privacy": "🔒 محادثاتك خاصة بحسابك. تُحفظ كلمات المرور كبصمات مشفّرة فقط، ويمكنك حذف حسابك "
+                       "وكل بياناتك في أي وقت من الشريط الجانبي.",
+            "signed_as": "مسجّل الدخول باسم",
+            "logout": "🚪 تسجيل الخروج",
+            "delete": "🗑️ حذف حسابي وبياناتي",
+            "delete_warn": "سيؤدي هذا إلى حذف حسابك وكل سجل محادثاتك نهائيًا.",
+            "delete_confirm": "نعم، احذف كل شيء",
+            "delete_btn": "حذف نهائي",
+            "guard_abuse": "يسعدني مساعدتك، لكن لا يمكنني المتابعة مع الألفاظ المسيئة. من فضلك حافظ على احترام "
+                           "الحوار، وحدّثني عن مشروعك أو اسأل عن خدماتنا. 🙏",
+            "guard_politics": "أحافظ على الحياد وأركّز على إنوفيتكس سوليوشن، لذلك لا أتحدث في السياسة. "
+                              "يسعدني مساعدتك في خدماتنا أو تقدير السعر أو حجز استشارة. 😊",
+            "guard_form": "من فضلك حافظ على احترام رسالتك وأن تكون متعلقة بمشروعك.",
+        },
         "guide": {
             "tab_chat": "💬 تحدث مع الوكيل", "tab_guide": "🧭 دليل خطوة بخطوة",
             "pick": "اختر الخدمة التي تهمّك للبدء",
@@ -730,6 +963,9 @@ def render_guide(t: dict, lang: str):
     st.session_state.setdefault("g_step", 0)
     st.session_state.setdefault("g_complexity", "medium")
     st.session_state.setdefault("g_weeks", 4)
+    me = st.session_state.get("user") or {}  # pre-fill the request form from the account
+    st.session_state.setdefault("g_name", me.get("name", ""))
+    st.session_state.setdefault("g_contact", me.get("email", ""))
     step = st.session_state.g_step
     service = st.session_state.get("g_service")
     st.progress(min(step + 1, 4) / 4 if step < 4 else 1.0)
@@ -790,6 +1026,8 @@ def render_guide(t: dict, lang: str):
         if sent:
             if not name.strip() or not contact.strip():
                 st.warning(g["need"])
+            elif has_abuse(f"{name} {when} {details}"):
+                st.warning(t["acct"]["guard_form"])
             else:
                 create_project_proposal(name.strip(), service, details.strip() or "-", cx, weeks)
                 book_consultation(name.strip(), contact.strip(), when.strip() or "-", service)
@@ -803,6 +1041,57 @@ def render_guide(t: dict, lang: str):
         st.success(g["done"])
         st.markdown(CONTACT_MD)
         st.button(g["restart"], key="g_restart", on_click=_g_restart)
+
+
+# ======================================================================
+# 5b) SIGN IN / CREATE ACCOUNT
+# ======================================================================
+def render_auth(t: dict):
+    a = t["acct"]
+    st.markdown(f'<div class="sec-title">{a["title"]}</div>', unsafe_allow_html=True)
+    st.info(a["intro"])
+    tab_in, tab_up = st.tabs([a["login"], a["register"]])
+
+    with tab_in:
+        with st.form("login_form"):
+            email = st.text_input(a["email"], key="li_email")
+            pw = st.text_input(a["password"], type="password", key="li_pw")
+            go = st.form_submit_button(a["login_btn"])
+        if go:
+            wait = st.session_state.get("lock_until", 0) - time.time()
+            if wait > 0:
+                st.error(a["locked"].format(sec=int(wait) + 1))
+            else:
+                user = authenticate(email, pw)
+                if user:
+                    st.session_state.fails = 0
+                    start_session(user)
+                    st.rerun()
+                st.session_state.fails = st.session_state.get("fails", 0) + 1
+                if st.session_state.fails >= MAX_LOGIN_FAILS:
+                    st.session_state.fails = 0
+                    st.session_state.lock_until = time.time() + LOGIN_LOCK_SECONDS
+                st.error(a["bad_login"])
+
+    with tab_up:
+        with st.form("register_form"):
+            name = st.text_input(a["name"], key="su_name")
+            email = st.text_input(a["email"], key="su_email")
+            pw = st.text_input(a["password"], type="password", key="su_pw")
+            pw2 = st.text_input(a["confirm"], type="password", key="su_pw2")
+            go = st.form_submit_button(a["register_btn"])
+        if go:
+            if has_abuse(name):
+                st.error(a["guard_form"])
+            else:
+                user, err = create_user(name, email, pw, pw2)
+                if err:
+                    st.error(a[err])
+                else:
+                    start_session(user)
+                    st.rerun()
+
+    st.caption(a["privacy"])
 
 
 # ======================================================================
@@ -828,16 +1117,18 @@ if lang == "ar":
     st.markdown(RTL_CSS, unsafe_allow_html=True)
 
 api_key = get_api_key()
-sid = get_sid()
+user = st.session_state.get("user")  # None until the visitor signs in
 
-if "messages" not in st.session_state:
-    st.session_state.messages = load_history(sid)
+if user and "messages" not in st.session_state:
+    st.session_state.messages = load_history(user["id"])  # only this user's own history
 
 
 def clear_chat():
     st.session_state.messages = []
     st.session_state.pop("chat", None)
-    history_path(sid).unlink(missing_ok=True)
+    me = st.session_state.get("user")
+    if me:
+        delete_history(me["id"])
 
 
 with st.sidebar:
@@ -845,11 +1136,19 @@ with st.sidebar:
     st.markdown("📧 " + EMAIL)
     st.markdown("📱 " + " | ".join(PHONES))
     st.link_button(t["cta_wa"], WHATSAPP_LINK)
-    st.divider()
-    st.button(t["clear"], key="clear_side", on_click=clear_chat)
-    transcript = "\n\n".join(f"[{m['role']}] {m['content']}" for m in st.session_state.messages) or "—"
-    st.download_button(t["download"], transcript, file_name="innovatex-chat.txt")
-    st.caption(t["saved"])
+    if user:
+        st.divider()
+        st.markdown(f'👤 **{user["name"]}**')
+        st.caption(f'{t["acct"]["signed_as"]} {user["email"]}')
+        st.button(t["acct"]["logout"], key="logout_side", on_click=logout)
+        st.button(t["clear"], key="clear_side", on_click=clear_chat)
+        transcript = "\n\n".join(f"[{m['role']}] {m['content']}" for m in st.session_state.messages) or "—"
+        st.download_button(t["download"], transcript, file_name="innovatex-chat.txt")
+        st.caption(t["saved"])
+        with st.expander(t["acct"]["delete"]):
+            st.caption(t["acct"]["delete_warn"])
+            confirm = st.checkbox(t["acct"]["delete_confirm"], key="del_confirm")
+            st.button(t["acct"]["delete_btn"], key="del_btn", disabled=not confirm, on_click=delete_account)
 
 # ---------- Hero ----------
 pills = "".join(f'<span class="pill">{p}</span>' for p in t["pills"])
@@ -874,61 +1173,71 @@ cards = "".join(
 st.markdown(f'<div class="sec-title">{t["services"]}</div><div class="grid">{cards}</div>',
             unsafe_allow_html=True)
 
-# ---------- Chat + Guide tabs ----------
-tab_chat, tab_guide = st.tabs([t["guide"]["tab_chat"], t["guide"]["tab_guide"]])
+# ---------- Account gate, then Chat + Guide tabs ----------
+if not user:
+    render_auth(t)
+else:
+    tab_chat, tab_guide = st.tabs([t["guide"]["tab_chat"], t["guide"]["tab_guide"]])
 
-with tab_guide:
-    render_guide(t, lang)
+    with tab_guide:
+        render_guide(t, lang)
 
-with tab_chat:
-    if not api_key:
-        st.info(t["key_info"])
-    else:
-        if "chat" not in st.session_state:
-            st.session_state.chat = create_chat(api_key, st.session_state.messages)
+    with tab_chat:
+        if not api_key:
+            st.info(t["key_info"])
+        else:
+            if "chat" not in st.session_state:
+                st.session_state.chat = create_chat(api_key, st.session_state.messages)
 
-        cols = st.columns(len(t["quick"]) + 1)
-        for i, (label, text) in enumerate(t["quick"]):
-            if cols[i].button(label, key=f"quick{i}"):
-                st.session_state.pending = text
-        cols[-1].button(t["clear"], key="clear_main", on_click=clear_chat)
+            cols = st.columns(len(t["quick"]) + 1)
+            for i, (label, text) in enumerate(t["quick"]):
+                if cols[i].button(label, key=f"quick{i}"):
+                    st.session_state.pending = text
+            cols[-1].button(t["clear"], key="clear_main", on_click=clear_chat)
 
-        # Messages go into a container that is created BEFORE the input bar, so the bar always stays
-        # below the whole conversation (including the reply that is being streamed right now).
-        chat_box = st.container()
-        prompt = st.chat_input(t["placeholder"])
-        if not prompt and st.session_state.get("pending"):
-            prompt = st.session_state.pop("pending")
+            # Messages go into a container that is created BEFORE the input bar, so the bar always stays
+            # below the whole conversation (including the reply that is being streamed right now).
+            chat_box = st.container()
+            prompt = st.chat_input(t["placeholder"])
+            if not prompt and st.session_state.get("pending"):
+                prompt = st.session_state.pop("pending")
 
-        with chat_box:
-            with st.chat_message("assistant"):
-                st.markdown(t["greeting"])
-            for m in st.session_state.messages:
-                with st.chat_message(m["role"]):
-                    st.markdown(m["content"])
-
-            if prompt:
-                with st.chat_message("user"):
-                    st.markdown(prompt)
+            with chat_box:
                 with st.chat_message("assistant"):
-                    if is_contact_request(prompt):
-                        # Answered directly from code: instant and always the exact, correct details
-                        reply = f"{t['contact_intro']}\n\n{CONTACT_MD}"
-                        st.markdown(reply)
-                        st.session_state.messages += [{"role": "user", "content": prompt},
-                                                      {"role": "assistant", "content": reply}]
-                        save_history(sid, st.session_state.messages)
-                        st.session_state.pop("chat", None)  # rebuilt from saved history on the next message
+                    st.markdown(t["greeting"])
+                for m in st.session_state.messages:
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
+
+                if prompt:
+                    flag = moderate_input(prompt)
+                    if flag:
+                        # Profanity / hatred / politics: polite redirect from code. The message is neither sent
+                        # to the model nor stored in the history.
+                        with st.chat_message("assistant"):
+                            st.markdown(t["acct"]["guard_abuse" if flag == "abuse" else "guard_politics"])
                     else:
-                        try:
-                            reply = st.write_stream(st.session_state.chat.stream_message(prompt))
-                            st.session_state.messages += [{"role": "user", "content": prompt},
-                                                          {"role": "assistant", "content": reply}]
-                            save_history(sid, st.session_state.messages)
-                        except Exception as e:
-                            print(f"[chat error] {e}", file=sys.stderr)  # details stay in the server logs only
-                            st.warning(t["busy"] if _is_busy(e) else t["err_generic"])
-                            st.session_state.pop("chat", None)  # rebuilt cleanly from saved history next time
+                        with st.chat_message("user"):
+                            st.markdown(prompt)
+                        with st.chat_message("assistant"):
+                            if is_contact_request(prompt):
+                                # Answered directly from code: instant and always the exact, correct details
+                                reply = f"{t['contact_intro']}\n\n{CONTACT_MD}"
+                                st.markdown(reply)
+                                st.session_state.messages += [{"role": "user", "content": prompt},
+                                                              {"role": "assistant", "content": reply}]
+                                save_history(user["id"], st.session_state.messages)
+                                st.session_state.pop("chat", None)  # rebuilt from saved history on the next message
+                            else:
+                                try:
+                                    reply = st.write_stream(st.session_state.chat.stream_message(prompt))
+                                    st.session_state.messages += [{"role": "user", "content": prompt},
+                                                                  {"role": "assistant", "content": reply}]
+                                    save_history(user["id"], st.session_state.messages)
+                                except Exception as e:
+                                    print(f"[chat error] {e}", file=sys.stderr)  # details stay in the server logs only
+                                    st.warning(t["busy"] if _is_busy(e) else t["err_generic"])
+                                    st.session_state.pop("chat", None)  # rebuilt cleanly from saved history next time
 
 st.markdown(contact_html(t), unsafe_allow_html=True)
 st.markdown(f'<div class="footer">{t["footer"]}</div>', unsafe_allow_html=True)
